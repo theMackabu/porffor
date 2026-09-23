@@ -40,7 +40,8 @@ const compile = async (file, _funcs) => {
   globalThis.file = file;
   const porfCompile = (await import(`./index.js?_=${Date.now()}`)).default;
 
-  const { funcs, data, times } = porfCompile(source);
+  const { funcs, data, times, dataStrKeys } = porfCompile(source);
+  const strKeyById = new Map(dataStrKeys);
   const funcsByIndex = new Map();
   for (const f of funcs) if (f) funcsByIndex.set(f.index, f);
 
@@ -169,6 +170,7 @@ const compile = async (file, _funcs) => {
       for (const i of dataRefs) {
         if (!data[i]) throw new Error(`${x.name}: missing data segment ${i}`);
         x.data[i] = data[i];
+        if (strKeyById.has(i)) (x.dataKeys ??= {})[i] = strKeyById.get(i);
       }
     }
     const funcData = {};
@@ -510,6 +512,7 @@ const precompile = async () => {
     if (localNames.length) { meta.localNames = localNames; meta.localTypes = localTypes; }
     if (localMeta.length) meta.localMetadata = localMeta;
     if (x.data && Object.keys(x.data).length) meta.data = x.data;
+    if (x.dataKeys) meta.dataKeys = x.dataKeys;
     if (x.funcData && Object.keys(x.funcData).length) meta.funcData = x.funcData;
     if (x.funcRefs && Object.keys(x.funcRefs).length) meta.funcRefs = x.funcRefs;
     if (x.constr) meta.constr = 1;

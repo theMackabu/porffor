@@ -191,13 +191,19 @@ const genStmt = (scope, node) => {
 // bytes pushed to `data` are referenced by DataRef(id), render assigns the offsets
 const i32Bytes = x => [ x & 0xff, (x >>> 8) & 0xff, (x >>> 16) & 0xff, (x >>> 24) & 0xff ];
 
+// string segments as [ id, '#str:<b|s>:<content>' ] in id order. compared by chars (not startsWith,
+// which misses a bytestring prefix of a utf-16 string when self-hosted)
+const isStrSegKey = key => key[0] === '#' && key[1] === 's' && key[2] === 't' && key[3] === 'r' && key[4] === ':';
 const dataSeg = (key, bytes) => {
   if (key != null) {
     const cached = dataCache.get(key);
     if (cached !== undefined) return cached;
   }
   const id = data.push(bytes) - 1;
-  if (key != null) dataCache.set(key, id);
+  if (key != null) {
+    dataCache.set(key, id);
+    if (isStrSegKey(key)) strSegs.push([ id, key ]);
+  }
   return id;
 };
 const dataRef = (key, bytes) => DataRef(dataSeg(key, bytes));
@@ -1183,7 +1189,7 @@ const irBuiltinHelpers = (scope, name, def) => ({
       return dataSeg(`#funcrec:${f.index}`, [ ...i32Bytes(f.index), ...i32Bytes(0) ]);
     }
     if (!def.data || !Object.hasOwn(def.data, id)) throw new Error(`${name}: missing precompiled data segment ${id}`);
-    return dataSeg(`builtin:${name}:${id}`, def.data[id]);
+    return dataSeg(def.dataKeys?.[id] ?? `builtin:${name}:${id}`, def.data[id]);
   },
   remapFuncIndex: idx => {
     if (!def.funcRefs || !Object.hasOwn(def.funcRefs, idx)) return idx;
@@ -3587,15 +3593,20 @@ const generateForIn = (scope, decl) => {
       const tmpName = tmp(scope, T.jsval)[N_A];
       const body = collect(scope, () => {
         stmt(scope, BlockStmt(collect(scope, () => {
-          setLocalWithType(scope, tmpName, false, Box(Load('u32', pointer, 4), Load('u8', pointer, 18)));
+          // key kind bits 4-5 (0b00 bytestring, 0b01 string, 0b10 symbol), flags bits 0-3
+          const meta = reuse(scope, Load('u8', pointer, 6));
+          const keyKind = reuse(scope, Bin('&', T.i32, meta, Const(T.i32, 0b110000)));
+          setLocalWithType(scope, tmpName, false, Box(Load('u32', pointer, 0),
+            Select(Bin('==', T.i32, keyKind, Const(T.i32, 0)), Const(T.i32, TYPES.bytestring),
+              Select(Bin('==', T.i32, keyKind, Const(T.i32, 0b010000)), Const(T.i32, TYPES.string), Const(T.i32, TYPES.symbol)))));
           generateLoopBinding(scope, decl.left, identNode(tmpName));
           emitIf(scope, Bin('&', T.i32,
-            Bin('!=', T.i32, Bin('&', T.i32, Load('u16', pointer, 16), Const(T.i32, 0b0100)), Const(T.i32, 0)),
-            Bin('!=', T.i32, Load('u8', pointer, 18), Const(T.i32, TYPES.symbol))),
+            Bin('!=', T.i32, Bin('&', T.i32, meta, Const(T.i32, 0b0100)), Const(T.i32, 0)),
+            Bin('!=', T.i32, keyKind, Const(T.i32, 0b100000))),
             () => genStmt(scope, decl.body));
         }), C));
         assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
-        assign(scope, pointer, Bin('+', T.u32, pointer, Const(T.u32, 20)));
+        assign(scope, pointer, Bin('+', T.u32, pointer, Const(T.u32, 16)));
       });
 
       inferLoopEnd(scope);
@@ -3836,6 +3847,15 @@ const makeString = (scope, str, bytestring = true) => {
   return valOf(dataRef(`#str:${bytestring ? 'b' : 's'}:${str}`, bytes), bytestring ? TYPES.bytestring : TYPES.string);
 };
 
+// integer literal (or negated one) that fits an i32 element, else null
+const i32Literal = x => {
+  let v;
+  if (x?.type === 'Literal' && typeof x.value === 'number') v = x.value;
+    else if (x?.type === 'UnaryExpression' && x.operator === '-' && x.argument.type === 'Literal' && typeof x.argument.value === 'number') v = -x.argument.value;
+    else return null;
+  return Number.isInteger(v) && !Object.is(v, -0) && v >= -2147483648 && v <= 2147483647 ? v : null;
+};
+
 const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) => {
   const elements = decl.elements;
   const length = elements.length;
@@ -3845,6 +3865,19 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
 
   let pointer;
   const isStatic = staticAlloc || decl._staticAlloc;
+
+  // all-int literal: i32 elements, tagged by entries pointer bit 0 (see render.js core layouts)
+  if (!isStatic && !globalThis.precompile && length > 0 && elements.every(x => i32Literal(x) != null)) {
+    pointer = reuse(scope, Alloc(Const(T.i32, 16 + length * 4), TYPES.array));
+    stmt(scope, LenSet(pointer, Const(T.i32, length)));
+    stmt(scope, Store('u32', pointer, 4, Bin('+', T.u32, pointer, Const(T.u32, 17))));
+    stmt(scope, Store('i32', pointer, 8, Const(T.i32, length)));
+    stmt(scope, Store('i32', pointer, 12, Const(T.i32, 0)));
+    for (let j = 0; j < length; j++) stmt(scope, Store('i32', pointer, 16 + j * 4, Const(T.i32, i32Literal(elements[j]))));
+
+    typeUsed(scope, TYPES.array);
+    return valOf(pointer, TYPES.array);
+  }
   if (isStatic) {
     const uniqueName = name === '$undeclared' ? name + uniqId() : name;
     pointer = dataRef(`#staticarr:${uniqueName}`, new Array(allocSize).fill(0));
@@ -3962,12 +3995,13 @@ const generateObject = (scope, decl) => {
       const prop = reuse(scope, generate(scope, key));
       const val = reuse(scope, generate(scope, value));
       const entries = Load('u32', JvPtr(obj), 12);
-      stmt(scope, Store('i32', entries, slot * 20, Const(T.i32, hash)));
-      stmt(scope, Store('u32', entries, slot * 20 + 4, JvPtr(prop)));
-      stmt(scope, Store('f64', entries, slot * 20 + 8, JvNum(val), true));
-      stmt(scope, Store('u8', entries, slot * 20 + 16, Const(T.i32, 14)));
-      stmt(scope, Store('u8', entries, slot * 20 + 17, JvType(val)));
-      stmt(scope, Store('u8', entries, slot * 20 + 18, JvType(prop)));
+      // entry: key, hash >>> 16, flags (writable, enumerable, configurable) | key kind (0b01 string, 0b00 bytestring) << 4, value type
+      const keyKind = Select(Bin('==', T.i32, JvType(prop), Const(T.i32, TYPES.string)), Const(T.i32, 0b011110), Const(T.i32, 0b1110));
+      stmt(scope, Store('u32', entries, slot * 16, JvPtr(prop)));
+      stmt(scope, Store('u16', entries, slot * 16 + 4, Const(T.i32, hash >>> 16)));
+      stmt(scope, Store('u8', entries, slot * 16 + 6, keyKind));
+      stmt(scope, Store('u8', entries, slot * 16 + 7, JvType(val)));
+      stmt(scope, Store('f64', entries, slot * 16 + 8, JvNum(val), true));
       stmt(scope, Store('u16', JvPtr(obj), 0, Const(T.i32, ++slot)));
       stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
     } else {
@@ -4086,12 +4120,13 @@ const generateMember = (scope, decl, objValue = null) => {
     if (hash == null) return builtinCall(scope, '__Porffor_object_get', [ obj, key ]);
 
     if (Prefs.ic && (known == null || known === TYPES.object)) {
+      // 24 byte slots: own entry offset, then a prototype hit (see __Porffor_object_get_ic)
       const index = icSite++ % 256;
       if (index === 0)
-        icChunk = dataSeg(`#ic:${icSite}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
+        icChunk = dataSeg(`#ic:${icSite}`, new Array(256).fill([ ...i32Bytes(0x7fffffff), ...new Array(20).fill(0) ]).flat());
 
       const chunk = DataRef(icChunk);
-      const slot = index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
+      const slot = index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 24));
       return builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), slot ]);
     }
 
@@ -5016,7 +5051,7 @@ const inferDirectCallParamTypes = root => {
   }
 };
 
-let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataCache, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
+let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataCache, strSegs, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
 
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
@@ -5028,6 +5063,7 @@ export default (program, opts = {}) => {
   depth = [];
   data = [];
   dataCache = new Map();
+  strSegs = [];
   rawHead = [];
   builtinGlobalInits = [];
   includedBuiltinGlobalInits = new Set();
@@ -5163,6 +5199,7 @@ export default (program, opts = {}) => {
   return {
     funcs: renderFuncs,
     data,
+    dataStrKeys: strSegs,
     globals: renderGlobals,
     entry: entryName,
     prefs: rawHead.length ? { ...Prefs, rawHead: [ Prefs.rawHead, ...rawHead ].filter(Boolean).join('\n') } : Prefs,

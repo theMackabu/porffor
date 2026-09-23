@@ -50,15 +50,15 @@ export const __Object_keys = (obj: any): any[] => {
 
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 16;
 
-    for (; ptr < endPtr; ptr += 20) {
+    for (; ptr < endPtr; ptr += 16) {
       if (!Porffor.object.isEnumerable(ptr)) continue;
 
       // if key is a symbol skip it
-      if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
+      if (__Porffor_object_isSymbolKey(ptr)) continue;
 
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      let key: any = __Porffor_object_readKey(ptr);
       if (arrayLen != -1) {
         const idx: i32 = __Porffor_array_propertyKeyIndex(key);
         if (Porffor.fastAnd(idx != -1, idx < arrayLen)) continue;
@@ -206,13 +206,13 @@ export const __Object_assign = (target: any, ...sources: any[]): any => {
     src = __Porffor_object_underlying(src);
     if (Porffor.type(src) == Porffor.TYPES.object) {
       let ptr: i32 = Porffor.object.entriesPtr(src);
-      const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+      const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 16;
 
-      for (; ptr < endPtr; ptr += 20) {
-        const tail: i32 = Porffor.IR.loadU16(ptr, 16);
+      for (; ptr < endPtr; ptr += 16) {
+        const tail: i32 = Porffor.IR.loadU8(ptr, 6); // flags, plus key kind bits above
         if (!(tail & 0b0100)) continue; // not enumerable
 
-        let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+        let key: any = __Porffor_object_readKey(ptr);
 
         let value: any;
         if (tail & 0b0001) {
@@ -393,7 +393,7 @@ export const __Object_getOwnPropertyDescriptor = (obj: any, prop: any): object|u
     return undefined;
   }
 
-  const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+  const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
   const out: object = {};
   out.configurable = !!(tail & 0b0010);
   out.enumerable = !!(tail & 0b0100);
@@ -447,12 +447,12 @@ export const __Object_getOwnPropertyNames = (obj: any): any[] => {
   obj = __Porffor_object_underlying(obj);
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 16;
 
-    for (; ptr < endPtr; ptr += 20) {
-      if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
+    for (; ptr < endPtr; ptr += 16) {
+      if (__Porffor_object_isSymbolKey(ptr)) continue;
 
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      let key: any = __Porffor_object_readKey(ptr);
       out[i++] = key;
     }
   }
@@ -468,13 +468,13 @@ export const __Object_getOwnPropertySymbols = (obj: any): any[] => {
   obj = __Porffor_object_underlying(obj);
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 16;
 
     let i: i32 = 0;
-    for (; ptr < endPtr; ptr += 20) {
-      if (Porffor.IR.loadU8(ptr, 18) != Porffor.TYPES.symbol) continue;
+    for (; ptr < endPtr; ptr += 16) {
+      if (!__Porffor_object_isSymbolKey(ptr)) continue;
 
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      let key: any = __Porffor_object_readKey(ptr);
       out[i++] = key;
     }
 
@@ -690,13 +690,13 @@ export const __Porffor_object_spread = (dst: object, src: any): object => {
   src = __Porffor_object_underlying(src);
   if (Porffor.type(src) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(src);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 16;
 
-    for (; ptr < endPtr; ptr += 20) {
-      const tail: i32 = Porffor.IR.loadU16(ptr, 16);
+    for (; ptr < endPtr; ptr += 16) {
+      const tail: i32 = Porffor.IR.loadU8(ptr, 6); // flags, plus key kind bits above
       if (!(tail & 0b0100)) continue; // not enumerable
 
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      let key: any = __Porffor_object_readKey(ptr);
 
       let value: any;
       if (tail & 0b0001) {
@@ -731,17 +731,17 @@ export const __Porffor_object_rest = (dst: object, src: any, ...blocklist: any[]
   src = __Porffor_object_underlying(src);
   if (Porffor.type(src) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(src);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 16;
     const blocklistLen: i32 = blocklist.length;
 
-    for (; ptr < endPtr; ptr += 20) {
-      const tail: i32 = Porffor.IR.loadU16(ptr, 16);
+    for (; ptr < endPtr; ptr += 16) {
+      const tail: i32 = Porffor.IR.loadU8(ptr, 6); // flags, plus key kind bits above
       if (!(tail & 0b0100)) continue; // not enumerable
 
       // if key is a symbol skip it, matching __Object_keys
-      if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
+      if (__Porffor_object_isSymbolKey(ptr)) continue;
 
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+      let key: any = __Porffor_object_readKey(ptr);
 
       let blocked: boolean = false;
       for (let i: i32 = 0; i < blocklistLen; i++) {

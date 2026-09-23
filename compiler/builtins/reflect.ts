@@ -104,10 +104,10 @@ export const __Reflect_ownKeys = (target: any) => {
   target = __Porffor_object_underlying(target);
   if (Porffor.type(target) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(target);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(target, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadU16(target, 0) * 16;
 
-    for (; ptr < endPtr; ptr += 20) {
-      let key: any = Porffor.as(Porffor.IR.loadI32(ptr, 4), Porffor.IR.loadU8(ptr, 18));
+    for (; ptr < endPtr; ptr += 16) {
+      let key: any = __Porffor_object_readKey(ptr);
 
       out[i++] = key;
     }

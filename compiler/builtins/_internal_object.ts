@@ -10,19 +10,20 @@ import type {} from './porffor.d.ts';
 //  padding (u16, 2)
 //  prototype (u32, 4)
 //  entries pointer (u32, 4)
-// per entry (20):
-//  key - hash (u32, 4)
+// per entry (16):
 //  key - value (u32, 4)
-//  value (f64, 8) or accessor pair (u32, 4 each)
+//  key - hash, top 16 bits (u16, 2)
 //  flags (u8, 1):
 //   accessor - 0b0001
 //   configurable - 0b0010
 //   enumerable - 0b0100
 //   writable - 0b1000
+//   key kind - 0b110000: 0b00 bytestring, 0b01 string, 0b10 symbol
 //  value - type (u8, 1)
-//  key - type (u8, 1)
-//  padding (u8, 1)
-// 20-byte stride means the value payload is only 8-aligned every other entry: it needs unaligned loads/stores
+//  value (f64, 8) or accessor pair (u32, 4 each)
+// string keys are stored canonical (render.js key table): content that has a static string is always
+// stored as that one pointer, so looking up by a static key compares pointers. only lookups by other
+// strings compare contents, using the hash to skip entries
 
 // hash key for hashmap
 export const __Porffor_object_hashMix = (hash: i32, word: i32): i32 => {
@@ -98,14 +99,53 @@ export const __Porffor_object_hash = (key: any): i32 => {
 };
 
 export const __Porffor_object_writeKey = (ptr: i32, key: any, hash: i32): void => {
-  Porffor.IR.storeI32(ptr, 0, hash);
+  let kind: i32 = 0;
+  if (Porffor.type(key) == Porffor.TYPES.string) kind = 0b010000;
+    else if (Porffor.type(key) == Porffor.TYPES.symbol) kind = 0b100000;
 
-  Porffor.IR.storeI32(ptr, 4, key);
-  Porffor.IR.storeU8(ptr, 18, Porffor.type(key));
+  // in C: bitwise ops here lower to u32, and storing a value >= 2^31 through i32 saturates
+  Porffor.c`{
+    u32 k = (u32)key.val, kd = (u32)kind;
+    if (kd != 0x20u && k >= PORF_STATIC_CANON_END) {
+      const u64 c = porf_key_canon(k, kd == 0x10u, hash);
+      if (c != ~0ull) { k = (u32)c; kd = (u32)(c >> 32) << 4; }
+    }
+    *(u32*)(MEM + (u32)ptr) = k;
+    *(u32*)(MEM + (u32)ptr + 4u) = ((u32)hash >> 16) | (kd << 16);
+  }`;
+};
+
+export const __Porffor_object_readKey = (ptr: i32): any => {
+  const kind: i32 = Porffor.IR.loadU8(ptr, 6) & 0b110000;
+  const key: i32 = Porffor.IR.loadI32(ptr, 0);
+  if (kind == 0) return Porffor.as(key, Porffor.TYPES.bytestring);
+  if (kind == 0b010000) return Porffor.as(key, Porffor.TYPES.string);
+  return Porffor.as(key, Porffor.TYPES.symbol);
+};
+
+export const __Porffor_object_isSymbolKey = (ptr: i32): boolean => {
+  return (Porffor.IR.loadU8(ptr, 6) & 0b110000) == 0b100000;
+};
+
+// target must be a string or bytestring whose hash matched
+export const __Porffor_object_keyMatches = (ptr: i32, target: any): boolean => {
+  if ((Porffor.IR.loadU8(ptr, 6) & 0b110000) == 0b100000) return false;
+  if (Porffor.IR.loadI32(ptr, 0) == Porffor.IR.ptr(target)) return true;
+  return Porffor.strcmp(__Porffor_object_readKey(ptr), target);
+};
+
+export const __Porffor_object_writeFlags = (ptr: i32, flags: i32): void => {
+  Porffor.c`*(u8*)(MEM + (u32)ptr + 6u) = (u8)((*(u8*)(MEM + (u32)ptr + 6u) & 0xF0u) | ((u32)flags & 0x0Fu));`;
+};
+
+export const __Porffor_object_writeValue = (ptr: i32, value: any, flags: i32): void => {
+  Porffor.c`porf_store_un_f64(MEM + (u32)ptr + 8u, value.val);
+  *(u8*)(MEM + (u32)ptr + 7u) = (u8)value.type;
+  *(u8*)(MEM + (u32)ptr + 6u) = (u8)((*(u8*)(MEM + (u32)ptr + 6u) & 0xF0u) | ((u32)flags & 0x0Fu));`;
 };
 
 export const __Porffor_object_new = (capacity: i32 = 4): object => {
-  const obj: object = Porffor.malloc(16 + capacity * 20);
+  const obj: object = Porffor.malloc(16 + capacity * 16);
   Porffor.IR.storeU16(obj, 0, 0);
   Porffor.IR.storeU16(obj, 2, capacity);
   Porffor.IR.storeU8(obj, 4, 0);
@@ -116,7 +156,7 @@ export const __Porffor_object_new = (capacity: i32 = 4): object => {
 };
 
 export const __Porffor_object_newShared = (capacity: i32 = 4): object => {
-  const obj: object = __Porffor_mallocShared(16 + capacity * 20);
+  const obj: object = __Porffor_mallocShared(16 + capacity * 16);
   Porffor.IR.storeU16(obj, 0, 0);
   Porffor.IR.storeU16(obj, 2, capacity);
   Porffor.IR.storeU8(obj, 4, 0);
@@ -138,10 +178,10 @@ export const __Porffor_object_ensureCapacity = (obj: any, needed: i32): i32 => {
   if (capacity == 0) capacity = 1;
   while (capacity < needed) capacity *= 2;
 
-  const newEntriesPtr: i32 = Porffor.malloc(capacity * 20);
+  const newEntriesPtr: i32 = Porffor.malloc(capacity * 16);
   const size: i32 = Porffor.IR.loadU16(obj, 0);
   if (size > 0) {
-    Porffor.IR.copy(newEntriesPtr, entriesPtr, size * 20);
+    Porffor.IR.copy(newEntriesPtr, entriesPtr, size * 16);
   }
 
   Porffor.IR.storeU16(obj, 2, capacity);
@@ -150,11 +190,19 @@ export const __Porffor_object_ensureCapacity = (obj: any, needed: i32): i32 => {
   return newEntriesPtr;
 };
 
+// bumped when an object some get IC cached a prototype hit through (root flags 0b0010) changes shape
+let protoEpoch: i32 = 1;
+
+export const __Porffor_object_protoChanged = (obj: any): void => {
+  if (Porffor.IR.loadU8(obj, 4) & 0b0010) protoEpoch++;
+};
+
 export const __Porffor_object_appendEntry = (obj: any, key: any, hash: i32): i32 => {
+  __Porffor_object_protoChanged(obj);
   const size: i32 = Porffor.IR.loadU16(obj, 0);
   const entriesPtr: i32 = __Porffor_object_ensureCapacity(obj, size + 1);
   Porffor.IR.storeU16(obj, 0, size + 1);
-  const entryPtr: i32 = entriesPtr + size * 20;
+  const entryPtr: i32 = entriesPtr + size * 16;
   __Porffor_object_writeKey(entryPtr, key, hash);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
   return entryPtr;
@@ -163,14 +211,12 @@ export const __Porffor_object_appendEntry = (obj: any, key: any, hash: i32): i32
 export const __Porffor_object_fastAdd = (obj: any, key: any, value: any, flags: i32): void => {
   const entryPtr: i32 = __Porffor_object_appendEntry(obj, key, __Porffor_object_hash(key));
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
 export const __Porffor_object_readValue = (entryPtr: i32): any => {
-  return Porffor.as(Porffor.IR.loadUnF64(entryPtr, 8), Porffor.IR.loadU8(entryPtr, 17));
+  return Porffor.as(Porffor.IR.loadUnF64(entryPtr, 8), Porffor.IR.loadU8(entryPtr, 7));
 };
 
 // store underlying (real) objects for hidden types
@@ -411,6 +457,7 @@ export const __Porffor_object_setPrototype = (obj: any, proto: any): void => {
   }
 
   if (__Porffor_object_isObjectOrNull(proto)) {
+    __Porffor_object_protoChanged(obj);
     Porffor.IR.storeI32(obj, 8, proto);
     Porffor.IR.storeU8(obj, 5, Porffor.type(proto));
     Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, proto);
@@ -444,12 +491,12 @@ export const __Porffor_object_overrideAllFlags = (obj: any, overrideOr: i32, ove
 
   let ptr: i32 = __Porffor_object_entriesPtr(obj);
   const size: i32 = Porffor.IR.loadU16(obj, 0);
-  const endPtr: i32 = ptr + size * 20;
+  const endPtr: i32 = ptr + size * 16;
 
-  for (; ptr < endPtr; ptr += 20) {
-    let flags: i32 = Porffor.IR.loadU8(ptr, 16);
+  for (; ptr < endPtr; ptr += 16) {
+    let flags: i32 = (Porffor.IR.loadU8(ptr, 6) & 0b1111);
     flags = (flags | overrideOr) & overrideAnd;
-    Porffor.IR.storeU8(ptr, 16, flags);
+    __Porffor_object_writeFlags(ptr, flags);
   }
 };
 
@@ -461,10 +508,10 @@ export const __Porffor_object_checkAllFlags = (obj: any, dataAnd: i32, accessorA
 
   let ptr: i32 = __Porffor_object_entriesPtr(obj);
   const size: i32 = Porffor.IR.loadU16(obj, 0);
-  const endPtr: i32 = ptr + size * 20;
+  const endPtr: i32 = ptr + size * 16;
 
-  for (; ptr < endPtr; ptr += 20) {
-    const flags: i32 = Porffor.IR.loadU8(ptr, 16);
+  for (; ptr < endPtr; ptr += 16) {
+    const flags: i32 = (Porffor.IR.loadU8(ptr, 6) & 0b1111);
     if (flags & 0b0001) {
       // accessor
       if ((flags & accessorAnd) != accessorExpected) return false;
@@ -500,27 +547,59 @@ export const __Porffor_object_writeAccessor = (entryPtr: i32, get: i32, set: i32
 export const __Porffor_object_lookup = (obj: any, target: any, targetHash: i32): i32 => {
   if (Porffor.IR.ptr(obj) == 0) return 0;
 
-  let ptr: i32 = __Porffor_object_entriesPtr(obj);
-  const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
-
   if (Porffor.comptime.flag`hasType.symbol`) {
     if (Porffor.type(target) == Porffor.TYPES.symbol) {
-      for (; ptr < endPtr; ptr += 20) {
-        const key: i32 = Porffor.IR.loadI32(ptr, 4);
-        if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) {
-          // todo: remove casts once weird bug which breaks unrelated things is fixed (https://github.com/CanadaHonk/porffor/commit/5747f0c1f3a4af95283ebef175cdacb21e332a52)
-          if (key as symbol == target as symbol) return ptr;
-        }
+      let ptr: i32 = __Porffor_object_entriesPtr(obj);
+      const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 16;
+      for (; ptr < endPtr; ptr += 16) {
+        if (Porffor.fastAnd(__Porffor_object_isSymbolKey(ptr), Porffor.IR.loadI32(ptr, 0) == Porffor.IR.ptr(target))) return ptr;
       }
 
       return 0;
     }
   }
 
-  for (; ptr < endPtr; ptr += 20) {
-    if (Porffor.IR.loadI32(ptr, 0) == targetHash) {
-      return ptr;
+  // a canonical key is the only pointer its content is stored under
+  Porffor.c`if ((u32)target.val < PORF_STATIC_CANON_END) {
+    u32 p = *(u32*)(MEM + (u32)obj.val + 12u);
+    const u32 end = p + ((u32)*(u16*)(MEM + (u32)obj.val) << 4);
+    for (; p < end; p += 16u) if (*(u32*)(MEM + p) == (u32)target.val) return (i32)p;
+    return 0;
+  }`;
+  return __Porffor_object_lookupDynamic(obj, target, targetHash);
+};
+
+// key is a static literal (every _withHash caller: codegen only passes a hash for literal names), so
+// canonical: its pointer is the only match
+export const __Porffor_object_lookupLit = (obj: any, key: any): i32 => {
+  Porffor.c`{
+    if ((u32)obj.val == 0u) return 0;
+    u32 p = *(u32*)(MEM + (u32)obj.val + 12u);
+    const u32 end = p + ((u32)*(u16*)(MEM + (u32)obj.val) << 4);
+    for (; p < end; p += 16u) if (*(u32*)(MEM + p) == (u32)key.val) return (i32)p;
+    return 0;
+  }`;
+  return 0;
+};
+
+// target is a non canonical string: use its canonical form, else compare contents
+export const __Porffor_object_lookupDynamic = (obj: any, target: any, targetHash: i32): i32 => {
+  let wide: i32 = 0;
+  if (Porffor.type(target) == Porffor.TYPES.string) wide = 1;
+  Porffor.c`{
+    const u64 c = porf_key_canon((u32)target.val, wide, targetHash);
+    if (c != ~0ull) {
+      u32 p = *(u32*)(MEM + (u32)obj.val + 12u);
+      const u32 end = p + ((u32)*(u16*)(MEM + (u32)obj.val) << 4);
+      for (; p < end; p += 16u) if (*(u32*)(MEM + p) == (u32)c) return (i32)p;
+      return 0;
     }
+  }`;
+
+  let ptr: i32 = __Porffor_object_entriesPtr(obj);
+  const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 16;
+  for (; ptr < endPtr; ptr += 16) {
+    if (Porffor.IR.loadU16(ptr, 4) == ((targetHash >>> 16) & 0xffff)) if (__Porffor_object_keyMatches(ptr, target)) return ptr;
   }
 
   return 0;
@@ -606,7 +685,7 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
     if (entryPtr == 0) return undefined;
   }
 
-  const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+  const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
   if (tail & 0b0001) {
     // accessor descriptor
     const get: Function = __Porffor_object_accessorGet(entryPtr);
@@ -624,10 +703,37 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const off: i32 = Porffor.IR.loadI32(slot, 0);
-      if (off < Porffor.IR.loadU16(_obj, 0) * 20) {
+      if (off < Porffor.IR.loadU16(_obj, 0) * 16) {
         const entryPtr: i32 = Porffor.IR.loadI32(_obj, 12) + off;
-        if (Porffor.IR.loadI32(entryPtr, 0) == hash) {
-          if ((Porffor.IR.loadU16(entryPtr, 16) & 0b0001) == 0) return __Porffor_object_readValue(entryPtr);
+        // the key is a static literal, so canonical: same pointer is the only match. any call here
+        // would cost this leaf function a register save per hit
+        if (Porffor.IR.loadI32(entryPtr, 0) == Porffor.IR.ptr(key)) {
+          if ((Porffor.IR.loadU8(entryPtr, 6) & 0b0001) == 0) return __Porffor_object_readValue(entryPtr);
+        }
+      }
+
+      // prototype hit: same receiver prototype, no own property shadowing it, and no shape change on the
+      // chain since (protoEpoch). slot: 4 receiver prototype, 20 its type, 8 holder, 12 entry offset, 16 epoch
+      const holder: i32 = Porffor.IR.loadI32(slot, 8);
+      if (holder != 0) if (Porffor.IR.loadI32(slot, 16) == protoEpoch) if (Porffor.fastAnd(
+        Porffor.IR.loadI32(_obj, 8) == Porffor.IR.loadI32(slot, 4),
+        Porffor.IR.loadU8(_obj, 5) == Porffor.IR.loadU8(slot, 20)
+      )) {
+        let p: i32 = Porffor.IR.loadI32(_obj, 12);
+        const end: i32 = p + Porffor.IR.loadU16(_obj, 0) * 16;
+        while (p < end) {
+          if (Porffor.IR.loadI32(p, 0) == Porffor.IR.ptr(key)) break;
+          p += 16;
+        }
+
+        if (p >= end) {
+          const hoff: i32 = Porffor.IR.loadI32(slot, 12);
+          if (hoff < Porffor.IR.loadU16(holder, 0) * 16) {
+            const e: i32 = Porffor.IR.loadI32(holder, 12) + hoff;
+            if (Porffor.IR.loadI32(e, 0) == Porffor.IR.ptr(key)) {
+              if ((Porffor.IR.loadU8(e, 6) & 0b0001) == 0) return __Porffor_object_readValue(e);
+            }
+          }
         }
       }
     }
@@ -641,14 +747,49 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
     if (Porffor.IR.ptr(_obj) != 0) {
       const entriesPtr: i32 = Porffor.IR.loadI32(_obj, 12);
       let ptr: i32 = entriesPtr;
-      const endPtr: i32 = ptr + Porffor.IR.loadU16(_obj, 0) * 20;
-      for (; ptr < endPtr; ptr += 20) {
-        if (Porffor.IR.loadI32(ptr, 0) == hash) {
+      const endPtr: i32 = ptr + Porffor.IR.loadU16(_obj, 0) * 16;
+      // the key is a static literal, so canonical: its pointer is the only one to match
+      for (; ptr < endPtr; ptr += 16) {
+        if (Porffor.IR.loadI32(ptr, 0) == Porffor.IR.ptr(key)) {
           // first writer wins so polymorphic sites miss instead of storing each time
           if (Porffor.IR.loadI32(slot, 0) == 2147483647) Porffor.IR.storeI32(slot, 0, ptr - entriesPtr);
-          if ((Porffor.IR.loadU16(ptr, 16) & 0b0001) == 0) return __Porffor_object_readValue(ptr);
-          break;
+          if ((Porffor.IR.loadU8(ptr, 6) & 0b0001) == 0) return __Porffor_object_readValue(ptr);
+          return __Porffor_object_get_withHash(_obj, key, hash);
         }
+      }
+
+      // not own: find it on the prototype chain (as get_withHash walks it) and cache a data property hit
+      let proto: any = __Porffor_object_getPrototype(_obj);
+      if (Porffor.type(proto) == Porffor.TYPES.undefined) proto = __Object_prototype;
+      let depth: i32 = 0;
+      while (Porffor.fastAnd(Porffor.type(proto) == Porffor.TYPES.object, Porffor.IR.ptr(proto) != 0, depth < 8)) {
+        const e: i32 = __Porffor_object_lookupLit(proto, key);
+        if (e != 0) {
+          if ((Porffor.IR.loadU8(e, 6) & 0b0001) != 0) break;
+
+          // flag the chain up to the holder: its shape changes now bump protoEpoch
+          let q: any = __Porffor_object_getPrototype(_obj);
+          if (Porffor.type(q) == Porffor.TYPES.undefined) q = __Object_prototype;
+          while (true) {
+            Porffor.IR.storeU8(q, 4, Porffor.IR.loadU8(q, 4) | 0b0010);
+            if (Porffor.IR.ptr(q) == Porffor.IR.ptr(proto)) break;
+            q = __Porffor_object_getPrototype(q);
+            if (Porffor.type(q) == Porffor.TYPES.undefined) q = __Object_prototype;
+          }
+
+          Porffor.IR.storeI32(slot, 4, Porffor.IR.loadI32(_obj, 8));
+          Porffor.IR.storeU8(slot, 20, Porffor.IR.loadU8(_obj, 5));
+          Porffor.IR.storeI32(slot, 8, Porffor.IR.ptr(proto));
+          Porffor.IR.storeI32(slot, 12, e - Porffor.IR.loadI32(proto, 12));
+          Porffor.IR.storeI32(slot, 16, protoEpoch);
+          return __Porffor_object_readValue(e);
+        }
+
+        let next: any = __Porffor_object_getPrototype(proto);
+        if (Porffor.type(next) == Porffor.TYPES.undefined) next = __Object_prototype;
+        if (Porffor.IR.ptr(next) == Porffor.IR.ptr(proto)) break;
+        proto = next;
+        depth++;
       }
     }
   }
@@ -667,7 +808,7 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   }
 
   let entryPtr: i32 = 0;
-  if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
+  if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookupLit(obj, key);
   if (entryPtr == 0) {
     // check prototype chain
     if (trueType == Porffor.TYPES.object) {
@@ -680,7 +821,7 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
     if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
     if (obj == null) return undefined;
     while (true) {
-      if ((entryPtr = __Porffor_object_lookup(obj, key, hash)) != 0) break;
+      if ((entryPtr = __Porffor_object_lookupLit(obj, key)) != 0) break;
 
       // inline get prototype
       obj = __Porffor_object_getPrototype(obj);
@@ -698,7 +839,7 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
     if (entryPtr == 0) return undefined;
   }
 
-  const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+  const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
   if (tail & 0b0001) {
     // accessor descriptor
     const get: Function = __Porffor_object_accessorGet(entryPtr);
@@ -772,7 +913,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
 
       if (entryPtr != 0) {
         // found possible setter
-        const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+        const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
         if (tail & 0b0001) {
           // accessor descriptor
           const set: Function = __Porffor_object_accessorSet(entryPtr);
@@ -796,7 +937,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     flags = 0b1110;
   } else {
     // existing entry, modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if (tail & 0b0001) {
       // accessor descriptor
@@ -814,12 +955,10 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     }
 
     // flags = same flags as before
-    flags = tail & 0xff;
+    flags = tail;
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 
   return value;
@@ -840,7 +979,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     return value;
   }
 
-  let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
+  let entryPtr: i32 = __Porffor_object_lookupLit(obj, key);
   let flags: i32;
   if (entryPtr == 0) {
     // todo/opt: skip if no setters used
@@ -850,7 +989,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
       if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
       let lastProto: any = proto;
       while (true) {
-        if ((entryPtr = __Porffor_object_lookup(proto, key, hash)) != 0) break;
+        if ((entryPtr = __Porffor_object_lookupLit(proto, key)) != 0) break;
 
         proto = __Porffor_object_getPrototype(proto);
         if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
@@ -860,7 +999,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
 
       if (entryPtr != 0) {
         // found possible setter
-        const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+        const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
         if (tail & 0b0001) {
           // accessor descriptor
           const set: Function = __Porffor_object_accessorSet(entryPtr);
@@ -884,7 +1023,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     flags = 0b1110;
   } else {
     // existing entry, modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if (tail & 0b0001) {
       // accessor descriptor
@@ -902,12 +1041,10 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     }
 
     // flags = same flags as before
-    flags = tail & 0xff;
+    flags = tail;
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 
   return value;
@@ -976,7 +1113,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
 
       if (entryPtr != 0) {
         // found possible setter
-        const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+        const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
         if (tail & 0b0001) {
           // accessor descriptor
           const set: Function = __Porffor_object_accessorSet(entryPtr);
@@ -1000,7 +1137,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     flags = 0b1110;
   } else {
     // existing entry, modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if (tail & 0b0001) {
       // accessor descriptor
@@ -1018,12 +1155,10 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     }
 
     // flags = same flags as before
-    flags = tail & 0xff;
+    flags = tail;
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 
   return value;
@@ -1044,7 +1179,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     return value;
   }
 
-  let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
+  let entryPtr: i32 = __Porffor_object_lookupLit(obj, key);
   let flags: i32;
   if (entryPtr == 0) {
     // todo/opt: skip if no setters used
@@ -1055,7 +1190,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
 
       let lastProto: any = proto;
       while (true) {
-        if ((entryPtr = __Porffor_object_lookup(proto, key, hash)) != 0) break;
+        if ((entryPtr = __Porffor_object_lookupLit(proto, key)) != 0) break;
 
         proto = __Porffor_object_getPrototype(proto);
         if (Porffor.type(proto) != Porffor.TYPES.object) proto = __Porffor_object_underlying(proto);
@@ -1065,7 +1200,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
 
       if (entryPtr != 0) {
         // found possible setter
-        const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+        const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
         if (tail & 0b0001) {
           // accessor descriptor
           const set: Function = __Porffor_object_accessorSet(entryPtr);
@@ -1089,7 +1224,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     flags = 0b1110;
   } else {
     // existing entry, modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if (tail & 0b0001) {
       // accessor descriptor
@@ -1107,12 +1242,10 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     }
 
     // flags = same flags as before
-    flags = tail & 0xff;
+    flags = tail;
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 
   return value;
@@ -1136,7 +1269,7 @@ export const __Porffor_object_define = (obj: any, key: any, value: any, flags: i
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else {
     // existing entry, check and maybe modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if ((tail & 0b0010) == 0) {
       // not already configurable, check to see if we can redefine
@@ -1160,9 +1293,7 @@ export const __Porffor_object_define = (obj: any, key: any, value: any, flags: i
     }
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
@@ -1187,7 +1318,7 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else {
     // existing entry, check and maybe modify it
-    const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
 
     if ((tail & 0b0010) == 0) {
       // not already configurable, check to see if we can redefine
@@ -1209,7 +1340,7 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
 
   __Porffor_object_writeAccessor(entryPtr, getRaw, setRaw);
 
-  Porffor.IR.storeU8(entryPtr, 16, flags);
+  __Porffor_object_writeFlags(entryPtr, flags);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
@@ -1237,20 +1368,21 @@ export const __Porffor_object_delete = (obj: any, key: any): boolean => {
     return true;
   }
 
-  const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+  const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
   if (!(tail & 0b0010)) {
     // not configurable
     return false;
   }
 
-  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 20;
+  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 16;
 
   // decrement size
+  __Porffor_object_protoChanged(obj);
   let size: i32 = Porffor.IR.loadU16(obj, 0);
   Porffor.IR.storeU16(obj, 0, --size);
 
   if (size > ind) {
-    Porffor.IR.copy(entryPtr, entryPtr + 20, (size - ind) * 20);
+    Porffor.IR.copy(entryPtr, entryPtr + 16, (size - ind) * 16);
   }
 
   return true;
@@ -1279,20 +1411,21 @@ export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
     return true;
   }
 
-  const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+  const tail: i32 = Porffor.IR.loadU8(entryPtr, 6); // flags, plus key kind bits above
   if (!(tail & 0b0010)) {
     // not configurable
     throw new TypeError('Cannot delete non-configurable property of object');
   }
 
-  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 20;
+  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 16;
 
   // decrement size
+  __Porffor_object_protoChanged(obj);
   let size: i32 = Porffor.IR.loadU16(obj, 0);
   Porffor.IR.storeU16(obj, 0, --size);
 
   if (size > ind) {
-    Porffor.IR.copy(entryPtr, entryPtr + 20, (size - ind) * 20);
+    Porffor.IR.copy(entryPtr, entryPtr + 16, (size - ind) * 16);
   }
 
   return true;
@@ -1300,7 +1433,7 @@ export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
 
 
 export const __Porffor_object_isEnumerable = (entryPtr: i32): boolean => {
-  return (Porffor.IR.loadU8(entryPtr, 16) & 0b0100) != 0;
+  return (Porffor.IR.loadU8(entryPtr, 6) & 0b0100) != 0;
 };
 
 
@@ -1321,9 +1454,7 @@ export const __Porffor_object_expr_init = (obj: any, key: any, value: any): void
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, 0b1110);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
@@ -1337,7 +1468,7 @@ export const __Porffor_object_expr_get = (obj: any, key: any, get: any): void =>
   if (entryPtr == 0) {
     // add new entry
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
-  } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+  } else if (Porffor.IR.loadU8(entryPtr, 6) & 0b0001) {
     // existing entry, keep set (if exists)
     set = __Porffor_object_accessorSet(entryPtr);
   }
@@ -1346,7 +1477,7 @@ export const __Porffor_object_expr_get = (obj: any, key: any, get: any): void =>
   __Porffor_object_writeAccessor(entryPtr, get, set);
 
   // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1111);
+  __Porffor_object_writeFlags(entryPtr, 0b1111);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
@@ -1361,7 +1492,7 @@ export const __Porffor_object_expr_set = (obj: any, key: any, set: any): void =>
   if (entryPtr == 0) {
     // add new entry
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
-  } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+  } else if (Porffor.IR.loadU8(entryPtr, 6) & 0b0001) {
     // existing entry, keep get (if exists)
     get = __Porffor_object_accessorGet(entryPtr);
   }
@@ -1370,7 +1501,7 @@ export const __Porffor_object_expr_set = (obj: any, key: any, set: any): void =>
   __Porffor_object_writeAccessor(entryPtr, get, set);
 
   // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1111);
+  __Porffor_object_writeFlags(entryPtr, 0b1111);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
@@ -1392,9 +1523,7 @@ export const __Porffor_object_class_value = (obj: any, key: any, value: any): vo
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, 0b1110);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
@@ -1414,9 +1543,7 @@ export const __Porffor_object_class_method = (obj: any, key: any, value: any): v
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeUnF64(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1010);
-  Porffor.IR.storeU8(entryPtr, 17, Porffor.type(value));
+  __Porffor_object_writeValue(entryPtr, value, 0b1010);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
 };
 
@@ -1435,7 +1562,7 @@ export const __Porffor_object_class_get = (obj: any, key: any, get: any): void =
     }
 
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
-  } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+  } else if (Porffor.IR.loadU8(entryPtr, 6) & 0b0001) {
     // existing entry, keep set (if exists)
     set = __Porffor_object_accessorSet(entryPtr);
   }
@@ -1444,7 +1571,7 @@ export const __Porffor_object_class_get = (obj: any, key: any, get: any): void =
   __Porffor_object_writeAccessor(entryPtr, get, set);
 
   // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1011);
+  __Porffor_object_writeFlags(entryPtr, 0b1011);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
@@ -1464,7 +1591,7 @@ export const __Porffor_object_class_set = (obj: any, key: any, set: any): void =
     }
 
     entryPtr = __Porffor_object_appendEntry(obj, key, hash);
-  } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
+  } else if (Porffor.IR.loadU8(entryPtr, 6) & 0b0001) {
     // existing entry, keep get (if exists)
     get = __Porffor_object_accessorGet(entryPtr);
   }
@@ -1473,7 +1600,7 @@ export const __Porffor_object_class_set = (obj: any, key: any, set: any): void =
   __Porffor_object_writeAccessor(entryPtr, get, set);
 
   // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1011);
+  __Porffor_object_writeFlags(entryPtr, 0b1011);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
   Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
 };
